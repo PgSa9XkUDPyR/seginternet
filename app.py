@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import socket
 import sys
+import zipfile
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
@@ -27,6 +30,138 @@ from seginternet.reporter.report import generate_report
 from seginternet.local.machine_check import (
     get_hostname, check_firewall, check_defender, build_remediation, RISKY_PORTS, EXTRA_PORTS,
 )
+
+# ---------------------------------------------------------------------------
+# Helpers de conexão remota e instalação
+# ---------------------------------------------------------------------------
+
+def _get_visitor_ip() -> str:
+    try:
+        h = st.context.headers
+        return (
+            h.get("cf-connecting-ip")
+            or h.get("x-forwarded-for", "").split(",")[0].strip()
+            or h.get("x-real-ip", "")
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _webrtc_component(height: int = 110) -> None:
+    components.html("""
+    <style>
+      body{font-family:sans-serif;background:#0e1117;color:#fafafa;padding:10px;margin:0;font-size:.95rem}
+      .ok{color:#00cc66;font-weight:600}.warn{color:#ffbb00;font-weight:600}.bad{color:#ff4444;font-weight:700}
+    </style>
+    <div id="r">⏳ Verificando WebRTC...</div>
+    <script>
+    (function(){
+      try{
+        const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.cloudflare.com:3478'}]});
+        pc.createDataChannel('x');
+        const seen=new Set();
+        pc.onicecandidate=e=>{
+          if(!e.candidate)return;
+          const m=/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/.exec(e.candidate.candidate);
+          if(!m||seen.has(m[1])||m[1]==='0.0.0.0')return;
+          seen.add(m[1]);
+          const isPriv=ip=>/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.)/.test(ip);
+          const pub=[...seen].filter(i=>!isPriv(i));
+          const priv=[...seen].filter(i=>isPriv(i));
+          let h='';
+          if(pub.length) h+=`⚠️ <span class="bad">IP público vazado via WebRTC: ${pub.join(', ')}</span><br>`;
+          if(priv.length) h+=`ℹ️ IPs locais: <span class="warn">${priv.join(', ')}</span>`;
+          if(!h) h='✅ <span class="ok">Nenhum vazamento WebRTC detectado.</span>';
+          document.getElementById('r').innerHTML=h;
+        };
+        pc.createOffer().then(o=>pc.setLocalDescription(o));
+        setTimeout(()=>{if(!seen.size)document.getElementById('r').innerHTML='✅ <span class="ok">Nenhum vazamento WebRTC detectado.</span>';},4500);
+      }catch(e){document.getElementById('r').innerHTML='⚠️ WebRTC indisponível neste navegador.';}
+    })();
+    </script>""", height=height)
+
+
+def _project_zip() -> bytes:
+    root = Path(__file__).parent
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in ("app.py", "requirements.txt", "pyproject.toml", "setup.cfg", "README.md"):
+            f = root / name
+            if f.exists():
+                zf.write(f, name)
+        src = root / "src"
+        if src.exists():
+            for f in src.rglob("*.py"):
+                zf.write(f, f.relative_to(root))
+    buf.seek(0)
+    return buf.read()
+
+
+_SETUP_WINDOWS = r"""# seginternet — Setup Windows
+# Coloque este arquivo na mesma pasta do seginternet.zip
+# Clique com botão direito > "Executar com PowerShell"
+
+$ErrorActionPreference = "Stop"
+$dir = "$env:USERPROFILE\seginternet"
+Write-Host "`n📦 seginternet — Instalação Windows" -ForegroundColor Cyan
+
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Host "Python não encontrado. Instalando via winget..." -ForegroundColor Yellow
+    winget install -e --id Python.Python.3.11 --accept-source-agreements --accept-package-agreements
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+}
+$ver = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+Write-Host "✔ Python $ver" -ForegroundColor Green
+
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$zip = Join-Path $PSScriptRoot "seginternet.zip"
+if (-not (Test-Path $zip)) {
+    Write-Host "❌ seginternet.zip não encontrado na mesma pasta deste script." -ForegroundColor Red
+    exit 1
+}
+Expand-Archive -Path $zip -DestinationPath $dir -Force
+Write-Host "✔ Arquivos extraídos em $dir" -ForegroundColor Green
+
+Set-Location $dir
+python -m venv .venv
+& ".venv\Scripts\pip" install -r requirements.txt -q
+& ".venv\Scripts\pip" install -e . -q
+Write-Host "✔ Dependências instaladas" -ForegroundColor Green
+Write-Host "`n✅ Pronto! Iniciando o app..." -ForegroundColor Green
+Start-Process ".venv\Scripts\python.exe" -ArgumentList "-m","streamlit","run","app.py" -WorkingDirectory $dir
+"""
+
+_SETUP_LINUX = """\
+#!/bin/bash
+# seginternet — Setup Linux / macOS
+# Coloque na mesma pasta do seginternet.zip e execute:
+#   chmod +x setup_linux.sh && ./setup_linux.sh
+
+set -e
+DIR="$HOME/seginternet"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+echo && echo "📦 seginternet — Instalação Linux/macOS"
+
+command -v python3 &>/dev/null || { echo "❌ Python3 não encontrado. Instale Python 3.11+"; exit 1; }
+echo "✔ Python $(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")"
+
+mkdir -p "$DIR"
+ZIP="$SCRIPT_DIR/seginternet.zip"
+[ -f "$ZIP" ] || { echo "❌ seginternet.zip não encontrado em $SCRIPT_DIR"; exit 1; }
+
+unzip -o "$ZIP" -d "$DIR" > /dev/null
+echo "✔ Arquivos extraídos em $DIR"
+
+cd "$DIR"
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -q
+.venv/bin/pip install -e . -q
+echo "✔ Dependências instaladas"
+echo && echo "✅ Pronto! Iniciando..."
+.venv/bin/python -m streamlit run app.py
+"""
+
 
 # ---------------------------------------------------------------------------
 # Configuração da página
@@ -173,6 +308,8 @@ with st.sidebar:
             "🌍 OpSec — Meu IP",
             "✅ OpSec — Checklist",
             "📊 Relatório Completo",
+            "🔎 Verificação Remota",
+            "💻 Instalar Localmente",
         ],
         label_visibility="collapsed",
     )
@@ -759,14 +896,20 @@ elif page == "💧 OpSec — DNS Leak":
 elif page == "🌍 OpSec — Meu IP":
     st.title("🌍 Informações do IP Público")
     st.markdown(
-        "Exibe geolocalização e informações do ISP do seu IP público atual. "
+        "Exibe geolocalização e informações do ISP do **seu IP real** — detectado pelo Cloudflare. "
         "Se você estiver usando VPN, mostrará o IP do servidor VPN."
     )
+
+    visitor_ip = _get_visitor_ip()
+    if visitor_ip:
+        st.success(f"IP detectado automaticamente: **`{visitor_ip}`**")
+    else:
+        st.warning("IP não detectado automaticamente (acesso local ou proxy desconhecido).")
 
     if st.button("🔍 Verificar meu IP"):
         with st.spinner("Consultando..."):
             try:
-                info = get_ip_info()
+                info = get_ip_info(visitor_ip if visitor_ip else None)
             except (ConnectionError, RuntimeError) as e:
                 st.error(str(e))
                 st.stop()
@@ -947,3 +1090,217 @@ elif page == "📊 Relatório Completo":
 
             with st.expander("Visualizar JSON"):
                 st.json(json.loads(json_str))
+
+# ---------------------------------------------------------------------------
+# Página: Verificação Remota
+# ---------------------------------------------------------------------------
+
+elif page == "🔎 Verificação Remota":
+    st.title("🔎 Verificação Remota")
+    st.markdown(
+        "Analisa **sua conexão atual** diretamente do navegador — funciona de qualquer rede, "
+        "sem instalar nada. Útil para verificar VPN, IP real e vazamentos."
+    )
+
+    visitor_ip = _get_visitor_ip()
+
+    st.divider()
+
+    # --- Bloco 1: IP Real ---
+    col_ip, col_rtc = st.columns(2)
+
+    with col_ip:
+        st.markdown("### 🌍 Seu IP Real")
+        if visitor_ip:
+            st.markdown(
+                f'<div class="info-card"><div class="label">IP detectado pelo Cloudflare</div>'
+                f'<div class="value">{visitor_ip}</div></div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("🔍 Ver geolocalização e ISP"):
+                with st.spinner("Consultando..."):
+                    try:
+                        info = get_ip_info(visitor_ip)
+                        cards = '<div class="info-row">'
+                        for label, value in [
+                            ("País", info.country),
+                            ("Cidade", info.city),
+                            ("ISP", info.isp),
+                            ("Fuso", info.timezone),
+                        ]:
+                            cards += info_card(label, value)
+                        cards += "</div>"
+                        st.markdown(cards, unsafe_allow_html=True)
+                        st.caption(f"Org: `{info.org}`")
+                    except Exception as e:
+                        st.warning(str(e))
+        else:
+            st.warning("IP não detectado — pode estar em acesso local.")
+
+    with col_rtc:
+        st.markdown("### 💧 WebRTC Leak")
+        st.caption(
+            "Testa se o seu navegador vaza o IP real mesmo com VPN ativa. "
+            "O teste roda localmente no seu browser — nenhum dado é enviado ao servidor."
+        )
+        _webrtc_component(height=80)
+
+    st.divider()
+
+    # --- Bloco 2: Análise de um host externo ---
+    st.markdown("### 📡 Análise Rápida de um Host")
+    st.caption("Escaneia um host de fora — útil para verificar o que está exposto na internet.")
+
+    with st.form("form_remoto"):
+        target = st.text_input("Host / domínio", placeholder="meusite.com")
+        c1, c2, c3 = st.columns(3)
+        do_ports = c1.checkbox("Portas TCP (1–1024)", value=True)
+        do_ssl   = c2.checkbox("SSL/TLS", value=True)
+        do_dns   = c3.checkbox("DNS (SPF/DMARC)", value=True)
+        sub = st.form_submit_button("⚡ Analisar", use_container_width=True)
+
+    if sub:
+        if not target.strip():
+            st.error("Informe um host.")
+        else:
+            try:
+                resolved = socket.gethostbyname(target.strip())
+                import ipaddress as _ip
+                addr = _ip.ip_address(resolved)
+                if addr.is_private or addr.is_loopback:
+                    st.error("IPs privados/internos não são permitidos.")
+                    st.stop()
+            except socket.gaierror:
+                st.error(f"Host não resolvido: `{target.strip()}`")
+                st.stop()
+
+            if do_ports:
+                with st.spinner("Escaneando portas..."):
+                    try:
+                        pr = scan_ports(target.strip(), start=1, end=1024, timeout=0.5)
+                        open_p = [r for r in pr if r.state == "open"]
+                        if open_p:
+                            st.warning(f"**{len(open_p)} porta(s) abertas:** " + ", ".join(f"`{r.port}/{r.service}`" for r in open_p))
+                        else:
+                            st.success("Nenhuma porta aberta (1–1024).")
+                    except Exception as e:
+                        st.warning(f"Portas: {e}")
+
+            if do_ssl:
+                with st.spinner("Verificando SSL..."):
+                    try:
+                        sr = check_ssl(target.strip())
+                        days_color = "sev-ok" if sr.days_until_expiry > 30 else "sev-high"
+                        st.markdown(
+                            f"**SSL:** `{sr.protocol_version}` — "
+                            f"expira em <span class='{days_color}'>{sr.days_until_expiry} dias</span> "
+                            f"({'auto-assinado ⚠️' if sr.is_self_signed else 'CA válida ✅'})",
+                            unsafe_allow_html=True,
+                        )
+                    except Exception as e:
+                        st.warning(f"SSL: {e}")
+
+            if do_dns:
+                with st.spinner("Consultando DNS..."):
+                    try:
+                        dr = check_dns(target.strip())
+                        st.markdown(
+                            f"**DNS:** SPF {'✅' if dr.has_spf else '❌'} | "
+                            f"DMARC {'✅' if dr.has_dmarc else '❌'} | "
+                            f"DNSSEC {'✅' if dr.has_dnssec else '❌'}"
+                        )
+                    except Exception as e:
+                        st.warning(f"DNS: {e}")
+
+# ---------------------------------------------------------------------------
+# Página: Instalar Localmente
+# ---------------------------------------------------------------------------
+
+elif page == "💻 Instalar Localmente":
+    st.title("💻 Instalar Localmente")
+    st.markdown(
+        "Instale o seginternet na sua máquina para analisar **seu próprio sistema** — "
+        "firewall, portas abertas, antivírus e DNS leak da sua conexão real."
+    )
+
+    st.info(
+        "**Por que instalar localmente?**  \n"
+        "A versão hospedada analisa o servidor. Para analisar sua própria máquina "
+        "(Windows Defender, portas abertas no seu computador, DNS do seu provedor), "
+        "você precisa rodar o app localmente."
+    )
+
+    st.divider()
+    st.markdown("## Passo a passo")
+
+    st.markdown("### 1️⃣ Baixe o código-fonte")
+    zip_data = _project_zip()
+    st.download_button(
+        label="⬇️ Baixar seginternet.zip",
+        data=zip_data,
+        file_name="seginternet.zip",
+        mime="application/zip",
+        use_container_width=True,
+        type="primary",
+    )
+
+    st.divider()
+    st.markdown("### 2️⃣ Baixe o script de instalação para seu sistema")
+
+    col_win, col_lin = st.columns(2)
+
+    with col_win:
+        st.markdown("#### 🪟 Windows")
+        st.markdown("Coloque o `.ps1` na mesma pasta do ZIP e execute com botão direito → *Executar com PowerShell*.")
+        st.download_button(
+            label="⬇️ setup_windows.ps1",
+            data=_SETUP_WINDOWS,
+            file_name="setup_windows.ps1",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        with st.expander("Ver conteúdo do script"):
+            st.code(_SETUP_WINDOWS, language="powershell")
+
+    with col_lin:
+        st.markdown("#### 🐧 Linux / 🍎 macOS")
+        st.markdown("Coloque o `.sh` na mesma pasta do ZIP e execute: `bash setup_linux.sh`")
+        st.download_button(
+            label="⬇️ setup_linux.sh",
+            data=_SETUP_LINUX,
+            file_name="setup_linux.sh",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        with st.expander("Ver conteúdo do script"):
+            st.code(_SETUP_LINUX, language="bash")
+
+    st.divider()
+    st.markdown("### 3️⃣ O que o script faz automaticamente")
+    st.markdown("""
+    | Passo | Descrição |
+    |-------|-----------|
+    | ✔ Verifica Python | Instala Python 3.11 via `winget` se não encontrar (Windows) |
+    | ✔ Extrai o ZIP | Coloca os arquivos em `~/seginternet` |
+    | ✔ Cria venv | Ambiente isolado — não afeta outros projetos Python |
+    | ✔ Instala dependências | `pip install -r requirements.txt` |
+    | ✔ Abre o app | Inicia o Streamlit e abre no navegador automaticamente |
+    """)
+
+    st.divider()
+    st.markdown("### 4️⃣ Instalação manual (alternativa)")
+    st.code("""\
+# Extraia o ZIP numa pasta, depois no terminal:
+
+python -m venv .venv
+
+# Windows:
+.venv\\Scripts\\pip install -r requirements.txt
+.venv\\Scripts\\pip install -e .
+.venv\\Scripts\\python -m streamlit run app.py
+
+# Linux / macOS:
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .
+.venv/bin/python -m streamlit run app.py
+""", language="bash")

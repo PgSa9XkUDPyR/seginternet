@@ -18,14 +18,16 @@ class IPInfo:
     org: str
 
 
-def get_ip_info() -> IPInfo:
+def get_ip_info(ip: str | None = None) -> IPInfo:
     """Obtém informações do IP público via ipapi.co.
 
+    Se *ip* for fornecido, consulta aquele IP específico; caso contrário usa o IP de saída do servidor.
     Levanta ConnectionError se a requisição falhar.
     Levanta RuntimeError se a API retornar erro (ex.: rate limit).
     """
+    url = f"https://ipapi.co/{ip}/json/" if ip else "https://ipapi.co/json/"
     try:
-        response = httpx.get("https://ipapi.co/json/", timeout=10.0)
+        response = httpx.get(url, timeout=10.0)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(
