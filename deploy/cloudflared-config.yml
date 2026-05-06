@@ -1,0 +1,20 @@
+# =============================================================================
+# Configuração do Cloudflare Tunnel para seginternet.rochainf.com.br
+#
+# INSTRUÇÕES:
+#   1. Execute no LXC: cloudflared tunnel create seginternet
+#   2. O comando acima exibe um Tunnel ID (formato UUID, ex: a1b2c3d4-...)
+#   3. Substitua TUNNEL_ID_AQUI pelo UUID real nas duas linhas abaixo
+#   4. O arquivo de credenciais é gerado automaticamente em:
+#      /root/.cloudflared/<TUNNEL_ID>.json
+#   5. Execute: cloudflared tunnel route dns seginternet seginternet.rochainf.com.br
+#   6. Inicie: systemctl start cloudflared
+# =============================================================================
+
+tunnel: TUNNEL_ID_AQUI
+credentials-file: /root/.cloudflared/TUNNEL_ID_AQUI.json
+
+ingress:
+  - hostname: seginternet.rochainf.com.br
+    service: http://localhost:8501
+  - service: http_status:404

@@ -1,0 +1,61 @@
+#!/bin/bash
+# =============================================================================
+# post-receive
+# Hook git executado no LXC após `git push`
+# Instalação: este arquivo é copiado para /opt/seginternet.git/hooks/post-receive
+# pelo script 02-setup-lxc.sh — mas pode ser atualizado manualmente.
+# Lembre-se de dar permissão: chmod +x /opt/seginternet.git/hooks/post-receive
+# =============================================================================
+
+GREEN="\e[32m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+RED="\e[31m"
+RESET="\e[0m"
+
+echo -e "\n${CYAN}[deploy] Iniciando deploy de seginternet...${RESET}"
+
+# -----------------------------------------------------------------------------
+# 1. Checkout forçado do branch main no diretório de trabalho
+# -----------------------------------------------------------------------------
+GIT_WORK_TREE=/opt/seginternet GIT_DIR=/opt/seginternet.git git checkout -f main
+echo -e "${GREEN}[deploy] Código atualizado em /opt/seginternet.${RESET}"
+
+# -----------------------------------------------------------------------------
+# 2. Entrar no diretório do projeto
+# -----------------------------------------------------------------------------
+cd /opt/seginternet
+
+# Garantir permissões corretas no diretório
+chown -R seginternet:seginternet /opt/seginternet
+
+# -----------------------------------------------------------------------------
+# 3. Instalar/atualizar dependências Python
+# -----------------------------------------------------------------------------
+echo -e "${CYAN}[deploy] Instalando dependências Python...${RESET}"
+if [[ -f requirements.txt ]]; then
+    /opt/seginternet/.venv/bin/pip install -r requirements.txt -q
+    echo -e "${GREEN}[deploy] Dependências instaladas com sucesso.${RESET}"
+else
+    echo -e "${YELLOW}[deploy] requirements.txt não encontrado — pulando pip install.${RESET}"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Reiniciar o serviço seginternet
+# -----------------------------------------------------------------------------
+echo -e "${CYAN}[deploy] Reiniciando serviço seginternet...${RESET}"
+systemctl restart seginternet
+
+# Aguardar o serviço subir
+sleep 2
+
+# -----------------------------------------------------------------------------
+# 5. Verificar e exibir resultado
+# -----------------------------------------------------------------------------
+if systemctl is-active --quiet seginternet; then
+    echo -e "\n${GREEN}✓ Deploy concluido — seginternet.rochainf.com.br atualizado${RESET}\n"
+else
+    echo -e "\n${RED}✗ ATENÇÃO: serviço seginternet não subiu!${RESET}"
+    echo -e "${RED}  Verifique com: journalctl -u seginternet -n 50${RESET}\n"
+    exit 1
+fi
