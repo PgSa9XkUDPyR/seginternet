@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import socket
 import sys
 from dataclasses import asdict
 from datetime import datetime
@@ -35,6 +38,54 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ---------------------------------------------------------------------------
+# Autenticação
+# ---------------------------------------------------------------------------
+
+_APP_USER = os.environ.get("APP_USER", "admin")
+_APP_PASSWORD_HASH = os.environ.get("APP_PASSWORD_HASH", "")
+
+
+def _hash(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def _login_gate() -> bool:
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown("""
+    <style>
+        .login-wrap { max-width: 380px; margin: 80px auto 0; }
+    </style>
+    <div class="login-wrap"></div>
+    """, unsafe_allow_html=True)
+
+    col = st.columns([1, 2, 1])[1]
+    with col:
+        st.markdown("## 🔒 seginternet")
+        st.caption("Análise de segurança de internet")
+        st.divider()
+        with st.form("login_form"):
+            username = st.text_input("Usuário")
+            password = st.text_input("Senha", type="password")
+            submitted = st.form_submit_button("Entrar", use_container_width=True)
+
+        if submitted:
+            if not _APP_PASSWORD_HASH:
+                st.error("Servidor não configurado: defina APP_USER e APP_PASSWORD_HASH.")
+            elif username == _APP_USER and _hash(password) == _APP_PASSWORD_HASH:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Usuário ou senha incorretos.")
+
+    return False
+
+
+if not _login_gate():
+    st.stop()
 
 st.markdown("""
 <style>
@@ -135,10 +186,18 @@ with st.sidebar:
 if page == "🖥️ Verificação da Máquina":
     hostname = get_hostname()
     st.title("🖥️ Verificação de Segurança da Máquina")
-    st.markdown(
-        f"Análise completa de **`{hostname}`** — verifica firewall, antivírus, "
-        "portas abertas e gera comandos de remediação para cada problema encontrado."
-    )
+    import platform as _platform
+    if _platform.system() != "Windows":
+        st.info(
+            f"ℹ️ **Modo servidor:** esta análise inspeciona a máquina onde o app está hospedado "
+            f"(`{hostname}`), não o seu computador local. "
+            "Para analisar sua máquina, instale e rode o seginternet localmente."
+        )
+    else:
+        st.markdown(
+            f"Análise completa de **`{hostname}`** — verifica firewall, antivírus, "
+            "portas abertas e gera comandos de remediação para cada problema encontrado."
+        )
 
     if st.button("⚡ Iniciar Verificação Completa", use_container_width=True, type="primary"):
         progress = st.progress(0)
@@ -413,6 +472,17 @@ elif page == "📡 Scanner — Portas TCP":
         if not host.strip():
             st.error("Informe um host.")
         else:
+            import ipaddress as _ipaddress
+            try:
+                resolved = socket.gethostbyname(host.strip())
+                addr = _ipaddress.ip_address(resolved)
+                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                    st.error("Scan de IPs privados/internos não é permitido no modo hospedado.")
+                    st.stop()
+            except socket.gaierror:
+                st.error(f"Não foi possível resolver o host: `{host.strip()}`")
+                st.stop()
+
             with st.spinner(f"Escaneando portas {int(start_port)}–{int(end_port)} em **{host}**..."):
                 try:
                     results = scan_ports(host, start=int(start_port), end=int(end_port), timeout=timeout)
