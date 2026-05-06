@@ -28,6 +28,7 @@ from seginternet.reporter.report import generate_report
 from seginternet.local.machine_check import (
     get_hostname, check_firewall, check_defender, build_remediation, RISKY_PORTS, EXTRA_PORTS,
 )
+from seginternet.local.malware_scanner import run_scan as _run_malware_scan
 
 # ---------------------------------------------------------------------------
 # Helpers de conexão remota e instalação
@@ -290,6 +291,7 @@ with st.sidebar:
         "Navegação",
         [
             "🖥️ Verificação da Máquina",
+            "🦠 Scanner de Malware",
             "📡 Scanner — Portas TCP",
             "🌐 Scanner — HTTP Headers",
             "🔐 Scanner — SSL/TLS",
@@ -305,6 +307,295 @@ with st.sidebar:
     )
     st.divider()
     st.caption("Ferramenta passiva/não-intrusiva. Use apenas em hosts que você tem autorização para analisar.")
+
+# ---------------------------------------------------------------------------
+# Helpers — Scanner de Malware
+# ---------------------------------------------------------------------------
+
+_STANDALONE_SCAN_SCRIPT = '''\
+#!/usr/bin/env python3
+"""
+seginternet - Scanner de Malware Standalone
+===========================================
+Requer: pip install psutil
+Execute: python scan_malware.py
+Gera:    scan_report_<hostname>_<data>.json
+
+Carregue o JSON na pagina "Scanner de Malware" do seginternet para visualizacao completa.
+"""
+from __future__ import annotations
+import json, platform, socket, sys
+from datetime import datetime
+
+try:
+    import psutil
+except ImportError:
+    sys.exit("Erro: psutil nao instalado.\\nExecute: pip install psutil")
+
+KNOWN_MALICIOUS = frozenset({
+    "njrat.exe","njw0rm.exe","darkcomet.exe","nanocore.exe","asyncrat.exe",
+    "async.exe","remcos.exe","quasar.exe","xrat.exe","xtreme.exe",
+    "cybergate.exe","blackshades.exe","bifrost.exe","bandook.exe","netbus.exe",
+    "sub7.exe","prorat.exe","havoc.exe","ardamax.exe","revealer.exe",
+    "spyrix.exe","kgb.exe","refog.exe","kidlogger.exe","xmrig.exe",
+    "minerd.exe","cpuminer.exe","ccminer.exe","cgminer.exe","sgminer.exe",
+    "svch0st.exe","svchost32.exe","svchost64.exe","1svchost.exe",
+    "csrss32.exe","lsass32.exe","explorer32.exe","explorer64.exe","rundll.exe",
+})
+
+SYSTEM_EXPECTED = {
+    "svchost.exe": r"c:\\windows\\system32",
+    "explorer.exe": r"c:\\windows",
+    "lsass.exe": r"c:\\windows\\system32",
+    "services.exe": r"c:\\windows\\system32",
+    "winlogon.exe": r"c:\\windows\\system32",
+    "csrss.exe": r"c:\\windows\\system32",
+    "smss.exe": r"c:\\windows\\system32",
+    "wininit.exe": r"c:\\windows\\system32",
+    "taskhostw.exe": r"c:\\windows\\system32",
+    "spoolsv.exe": r"c:\\windows\\system32",
+    "dwm.exe": r"c:\\windows\\system32",
+    "conhost.exe": r"c:\\windows\\system32",
+    "dllhost.exe": r"c:\\windows\\system32",
+    "rundll32.exe": r"c:\\windows\\system32",
+    "cmd.exe": r"c:\\windows\\system32",
+    "powershell.exe": r"c:\\windows\\system32\\windowspowershell",
+}
+
+SUSPICIOUS_DIRS = (
+    r"\\temp\\", r"/tmp/", r"\\appdata\\local\\temp",
+    r"\\appdata\\roaming", r"c:\\windows\\temp",
+    r"c:\\users\\public", r"\\$recycle", r"\\programdata\\",
+)
+
+RAT_PORTS = {
+    1243:"Sub-7",2745:"Bagle C2",4444:"Metasploit",6666:"Backdoor IRC",
+    6667:"Backdoor IRC",7777:"God Message",8787:"Back Orifice 2k",
+    9999:"Aladino",12345:"NetBus",12346:"NetBus 2",20034:"NetBus Pro",
+    27374:"Sub-7",31337:"Back Orifice",31338:"Back Orifice 2000",
+    54321:"SchoolBus",65000:"Devil",
+}
+TOR_PORTS = {9001,9030,9050,9051,9150}
+
+def scan_processes():
+    findings, total = [], 0
+    for proc in psutil.process_iter(["pid","name","exe","username"]):
+        try:
+            total += 1
+            info = proc.info
+            name = (info.get("name") or "").strip()
+            exe  = (info.get("exe")  or "").strip()
+            user = (info.get("username") or "?").strip()
+            pid  = info.get("pid", 0)
+            nl, el = name.lower(), exe.lower()
+            if nl in KNOWN_MALICIOUS:
+                findings.append({"pid":pid,"name":name,"path":exe,"user":user,
+                    "severity":"critical","reason":"Nome de malware/RAT conhecido","category":"known_malware"})
+            elif platform.system()=="Windows" and nl in SYSTEM_EXPECTED:
+                exp = SYSTEM_EXPECTED[nl]
+                if exe and exp not in el:
+                    findings.append({"pid":pid,"name":name,"path":exe,"user":user,
+                        "severity":"critical","reason":f"Processo de sistema fora do caminho esperado ({exp})",
+                        "category":"system_impersonation"})
+            elif exe and any(s in el for s in SUSPICIOUS_DIRS):
+                findings.append({"pid":pid,"name":name,"path":exe,"user":user,
+                    "severity":"high","reason":"Executavel em diretorio temporario/suspeito",
+                    "category":"suspicious_path"})
+        except Exception:
+            pass
+    return {"total_scanned":total,"findings":findings}
+
+def scan_network():
+    findings, total = [], 0
+    pid_cache = {}
+    def pname(pid):
+        if pid not in pid_cache:
+            try: pid_cache[pid] = psutil.Process(pid).name()
+            except: pid_cache[pid] = "?"
+        return pid_cache[pid]
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.status not in ("ESTABLISHED","LISTEN","SYN_SENT","SYN_RECV"):
+                continue
+            total += 1
+            pid = c.pid or 0
+            local = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "?"
+            remote = f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else ""
+            rport = c.raddr.port if c.raddr else None
+            lport = c.laddr.port if c.laddr else None
+            proc = pname(pid) if pid else "sistema"
+            if rport and rport in RAT_PORTS:
+                findings.append({"local":local,"remote":remote,"status":c.status,
+                    "pid":pid,"process":proc,"severity":"critical",
+                    "reason":f"Conexao a porta de RAT: {RAT_PORTS[rport]}"})
+            elif not c.raddr and lport and lport in RAT_PORTS:
+                findings.append({"local":local,"remote":"(ouvindo)","status":c.status,
+                    "pid":pid,"process":proc,"severity":"high",
+                    "reason":f"Processo escutando em porta de RAT: {RAT_PORTS[lport]}"})
+            elif rport and rport in TOR_PORTS:
+                findings.append({"local":local,"remote":remote,"status":c.status,
+                    "pid":pid,"process":proc,"severity":"medium","reason":"Conexao a porta Tor"})
+    except Exception as e:
+        return {"total_connections":0,"error":str(e),"findings":[]}
+    return {"total_connections":total,"error":"","findings":findings}
+
+def scan_registry():
+    if platform.system() != "Windows":
+        return {"skipped":True,"error":"Apenas Windows","keys_scanned":0,"findings":[]}
+    try:
+        import winreg
+    except ImportError:
+        return {"skipped":True,"error":"winreg indisponivel","keys_scanned":0,"findings":[]}
+    KEYS = [
+        (0x80000002, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
+        (0x80000002, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"),
+        (0x80000001, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
+        (0x80000001, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"),
+        (0x80000002, r"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"),
+        (0x80000002, r"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows"),
+    ]
+    HNAMES = {0x80000001:"HKCU",0x80000002:"HKLM"}
+    findings, scanned = [], 0
+    for hive, kpath in KEYS:
+        scanned += 1
+        try:
+            with winreg.OpenKey(hive, kpath, 0, winreg.KEY_READ) as k:
+                i = 0
+                while True:
+                    try:
+                        vn, vd, _ = winreg.EnumValue(k, i); i += 1
+                        dl, nl = str(vd).lower(), vn.lower()
+                        sev, reason = "", ""
+                        if any(s in dl for s in SUSPICIOUS_DIRS):
+                            sev, reason = "high","Autorun aponta para diretorio suspeito"
+                        elif "userinit" in nl and "userinit.exe," not in dl:
+                            sev, reason = "critical","Winlogon Userinit modificado"
+                        elif nl == "shell" and dl not in ("explorer.exe",""):
+                            sev, reason = "critical","Winlogon Shell modificado"
+                        elif nl == "appinit_dlls" and str(vd).strip():
+                            sev, reason = "high","AppInit_DLLs preenchido"
+                        if sev:
+                            findings.append({"hive":HNAMES.get(hive,"?"),"key":kpath,
+                                "value_name":vn,"value_data":str(vd)[:200],
+                                "severity":sev,"reason":reason})
+                    except OSError:
+                        break
+        except Exception:
+            continue
+    return {"skipped":False,"error":"","keys_scanned":scanned,"findings":findings}
+
+def _standalone_main():
+    print("\\n=== seginternet - Scanner de Malware ===")
+    print(f"Host: {socket.gethostname()} | OS: {platform.system()} {platform.release()}")
+    print("Escaneando processos, registro e conexoes de rede...\\n")
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "hostname": socket.gethostname(),
+        "os": f"{platform.system()} {platform.release()}",
+        "processes": scan_processes(),
+        "registry": scan_registry(),
+        "network": scan_network(),
+    }
+    all_f = report["processes"]["findings"] + report["registry"].get("findings",[]) + report["network"]["findings"]
+    report["summary"] = {
+        "total": len(all_f),
+        "critical": sum(1 for f in all_f if f.get("severity")=="critical"),
+        "high":     sum(1 for f in all_f if f.get("severity")=="high"),
+        "medium":   sum(1 for f in all_f if f.get("severity")=="medium"),
+        "low":      sum(1 for f in all_f if f.get("severity")=="low"),
+    }
+    fname = f"scan_report_{socket.gethostname()}_{datetime.now().strftime(\'%Y%m%d_%H%M%S\')}.json"
+    with open(fname, "w", encoding="utf-8") as fp:
+        json.dump(report, fp, ensure_ascii=False, indent=2)
+    s = report["summary"]
+    print(f"Resultados: {s[\'total\']} achados - {s[\'critical\']} CRITICOS, {s[\'high\']} ALTOS")
+    print(f"Relatorio salvo: {fname}")
+    print("\\nCarregue o JSON na pagina \'Scanner de Malware\' do seginternet para visualizacao.")
+
+if __name__ == "__main__":
+    _standalone_main()
+'''
+
+
+def _render_malware_findings_table(findings: list, category: str) -> None:
+    if not findings:
+        st.success(f"Nenhuma ameaça encontrada em: {category}")
+        return
+    rows = []
+    for f in findings:
+        sev = f.severity if hasattr(f, "severity") else f.get("severity", "?")
+        sev_html = badge(sev, sev)
+        name   = getattr(f, "name", None) or f.get("name") or f.get("process", "?")
+        detail = getattr(f, "path", None) or f.get("path") or f.get("remote", "?") or f.get("value_data", "?")
+        pid_val = getattr(f, "pid", None) or f.get("pid") or "—"
+        reason  = getattr(f, "reason", None) or f.get("reason", "—")
+        rows.append(
+            f"<tr><td>{sev_html}</td><td><b>{name}</b></td>"
+            f"<td><code style='font-size:.8rem;word-break:break-all'>{str(detail)[:80]}</code></td>"
+            f"<td style='color:#aaa'>{pid_val}</td><td>{reason}</td></tr>"
+        )
+    st.markdown(
+        '<table class="seg"><thead><tr>'
+        "<th>Sev.</th><th>Nome</th><th>Caminho / Detalhe</th><th>PID</th><th>Motivo</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_malware_report(report_data: dict) -> None:
+    summary = report_data.get("summary", {})
+    proc    = report_data.get("processes", {})
+    reg     = report_data.get("registry", {})
+    net     = report_data.get("network", {})
+
+    total = summary.get("total_findings") or summary.get("total", 0)
+    crit  = summary.get("critical", 0)
+    high  = summary.get("high", 0)
+    med   = summary.get("medium", 0)
+    low   = summary.get("low", 0)
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total", total)
+    col2.metric("Críticos", crit)
+    col3.metric("Altos", high)
+    col4.metric("Médios", med)
+    col5.metric("Baixos", low)
+
+    if crit > 0:
+        st.error(f"⚠️ {crit} achado(s) CRÍTICO(S). Investigação imediata recomendada.")
+    elif high > 0:
+        st.warning(f"⚠️ {high} achado(s) de severidade ALTA.")
+    elif total > 0:
+        st.info(f"ℹ️ {total} achado(s) de baixa/média severidade.")
+    else:
+        st.success("✅ Nenhum indicador de comprometimento encontrado.")
+
+    st.divider()
+    proc_findings = proc.get("findings", [])
+    st.markdown(f"#### Processos ({len(proc_findings)} achados de {proc.get('total_scanned', '?')} analisados)")
+    if proc.get("error"):
+        st.warning(proc["error"])
+    else:
+        _render_malware_findings_table(proc_findings, "processos")
+
+    st.divider()
+    reg_findings = reg.get("findings", [])
+    st.markdown(f"#### Registro do Windows ({len(reg_findings)} achados)")
+    if reg.get("skipped"):
+        st.info(reg.get("error", "Análise de registro ignorada (não-Windows)."))
+    elif reg.get("error"):
+        st.warning(reg["error"])
+    else:
+        _render_malware_findings_table(reg_findings, "registro")
+
+    st.divider()
+    net_findings = net.get("findings", [])
+    st.markdown(f"#### Conexões de Rede ({len(net_findings)} suspeitas de {net.get('total_connections', '?')} ativas)")
+    if net.get("error"):
+        st.warning(net["error"])
+    else:
+        _render_malware_findings_table(net_findings, "conexões")
+
 
 # ---------------------------------------------------------------------------
 # Página: Verificação da Máquina Atual
@@ -575,6 +866,106 @@ if page == "🖥️ Verificação da Máquina":
             f'</div>',
             unsafe_allow_html=True,
         )
+
+
+elif page == "🦠 Scanner de Malware":
+    import platform as _plat
+    import json as _json
+
+    hostname = get_hostname()
+    st.title("🦠 Scanner de Malware")
+    st.markdown(
+        "Detecta processos suspeitos, persistências no registro e conexões a RATs/backdoors. "
+        "Use **localmente** para analisar sua própria máquina — inclusive quando estiver fora de casa."
+    )
+
+    is_server = _plat.system() != "Windows"
+    if is_server:
+        st.info(
+            f"ℹ️ **Modo servidor:** esta varredura inspeciona **`{hostname}`** (CT 102), "
+            "não o seu computador pessoal.  \n"
+            "Para varrer seu computador: **baixe o script standalone** abaixo, execute-o na sua máquina "
+            "e carregue o relatório JSON aqui para visualização."
+        )
+
+    tab_scan, tab_upload = st.tabs(["⚡ Varrer esta máquina", "📂 Carregar relatório salvo"])
+
+    # ---- TAB 1: Scan ao vivo ------------------------------------------------
+    with tab_scan:
+        if is_server:
+            st.caption(f"Máquina alvo: **`{hostname}`** ({_plat.system()} {_plat.release()})")
+
+        col_btn, col_dl = st.columns([2, 1])
+        run_btn = col_btn.button("⚡ Iniciar Varredura", use_container_width=True, type="primary")
+        col_dl.download_button(
+            label="⬇️ Script standalone (.py)",
+            data=_STANDALONE_SCAN_SCRIPT,
+            file_name="scan_malware.py",
+            mime="text/plain",
+            use_container_width=True,
+            help="Execute em qualquer PC com Python + psutil para gerar um relatório JSON",
+        )
+
+        if run_btn:
+            with st.spinner("Analisando processos, registro e conexões..."):
+                report = _run_malware_scan()
+
+            st.session_state["malware_report"] = report
+            st.session_state["malware_json"] = report.to_json()
+
+        if "malware_report" in st.session_state:
+            report = st.session_state["malware_report"]
+            report_json = st.session_state["malware_json"]
+            data = _json.loads(report_json)
+
+            st.divider()
+            st.caption(
+                f"Varredura em `{data.get('hostname', '?')}` — "
+                f"{data.get('os', '?')} — {data.get('timestamp', '')[:19]}"
+            )
+
+            _render_malware_report(data)
+
+            st.divider()
+            fname = f"scan_malware_{data.get('hostname','host')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            st.download_button(
+                label="⬇️ Baixar relatório JSON",
+                data=report_json,
+                file_name=fname,
+                mime="application/json",
+                use_container_width=True,
+            )
+
+    # ---- TAB 2: Upload de relatório -----------------------------------------
+    with tab_upload:
+        st.markdown(
+            "Carregue um relatório gerado pelo **script standalone** para visualizar os resultados "
+            "de qualquer máquina — mesmo sem instalar o app completo nela."
+        )
+        st.markdown(
+            "**Como gerar o relatório em outro PC:**\n"
+            "```\n"
+            "pip install psutil\n"
+            "python scan_malware.py\n"
+            "```\n"
+            "O script gera `scan_report_<hostname>_<data>.json` — faça upload abaixo."
+        )
+
+        uploaded = st.file_uploader(
+            "Carregar relatório JSON", type=["json"], accept_multiple_files=False
+        )
+        if uploaded:
+            try:
+                data = _json.load(uploaded)
+            except Exception as e:
+                st.error(f"Arquivo JSON inválido: {e}")
+            else:
+                st.success(
+                    f"Relatório de **`{data.get('hostname', '?')}`** — "
+                    f"{data.get('os', '?')} — {data.get('timestamp', '')[:19]}"
+                )
+                st.divider()
+                _render_malware_report(data)
 
 # ---------------------------------------------------------------------------
 # Página: Scanner — Portas TCP
