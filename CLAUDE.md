@@ -34,7 +34,7 @@ pytest tests/test_ports.py::TestScanPorts::test_open_port
 
 ---
 
-## Estado atual do deploy (2026-05-06) — PRODUÇÃO ✅
+## Estado atual do deploy (2026-05-06, atualizado) — PRODUÇÃO ✅
 
 Tudo rodando. Site público: **https://seginternet.rochainf.com.br**
 
@@ -264,7 +264,36 @@ Todos os módulos retornam `dataclasses`. O reporter usa `dataclasses.asdict` pa
 
 ---
 
-## Funcionalidades adicionadas (sessão 2026-05-06)
+## Funcionalidades adicionadas (sessão 2 — 2026-05-06)
+
+### Scanner de Malware (`🦠`)
+Nova página e módulos completos de detecção de IoCs:
+
+**Módulos (`src/seginternet/local/`):**
+- `ioc_database.py` — Base de dados de IoCs: RATs/keyloggers/miners conhecidos, portas C2, paths suspeitos, chaves de registro de persistência
+- `process_analyzer.py` — Detecta: nomes de malware (`psutil.process_iter`), impersonação de processos de sistema (path errado), executáveis em diretórios temporários
+- `registry_scanner.py` — Varre chaves de persistência do Windows (Run, RunOnce, Winlogon, AppInit_DLLs) — só Windows via `winreg`
+- `network_monitor.py` — Detecta conexões a portas de RAT/backdoor/C2, portas Tor
+- `malware_scanner.py` — Orquestrador: executa os 3 módulos, retorna `MalwareScanReport` com `.to_json()`
+
+**Interface (app.py):**
+- Página `🦠 Scanner de Malware` com dois tabs:
+  - **"Varrer esta máquina"**: executa scan ao vivo, exibe tabelas por severidade, download JSON
+  - **"Carregar relatório salvo"**: upload de JSON gerado em outro PC para visualização
+- Botão de download do **script standalone** `scan_malware.py` (só precisa de `pip install psutil`)
+- Quando no servidor (Linux), exibe banner explicando que analisa CT 102 + instrui download do standalone
+
+**Fluxo para verificar PCs remotos (fora da rede):**
+1. Baixar `scan_malware.py` da página do site
+2. No PC alvo: `pip install psutil && python scan_malware.py`
+3. Gera `scan_report_<host>_<data>.json` localmente
+4. Fazer upload na aba "Carregar relatório salvo" do site para visualização completa
+
+**Dependência adicionada:** `psutil>=5.9` em `requirements.txt` (instalado no CT 102 via pip)
+
+---
+
+## Funcionalidades adicionadas (sessão 1 — 2026-05-06)
 
 ### Autenticação (`app.py`)
 - Login/senha obrigatório via `st.session_state`
@@ -305,3 +334,5 @@ Todos os módulos retornam `dataclasses`. O reporter usa `dataclasses.asdict` pa
 - [ ] Revogar token GitHub usado para criar o repo (gerado em github.com/settings/tokens) após confirmar que não é mais necessário
 - [ ] Avaliar adicionar `README.md` ao repositório GitHub
 - [ ] Testar instalação local via `setup_windows.ps1` em máquina limpa
+- [ ] Ampliar base de IoCs do scanner de malware (adicionar hashes MD5/SHA256 de binários maliciosos conhecidos)
+- [ ] Analisar falso positivo `dllhost.exe` — DllHost pode rodar de variantes de path legítimas (WOW64 etc.)
