@@ -81,7 +81,7 @@ def _webrtc_component(height: int = 110) -> None:
 
 
 
-_REPO_URL = "https://github.com/rochainf/seginternet.git"
+_REPO_URL = "https://github.com/PgSa9XkUDPyR/seginternet.git"
 
 _SETUP_WINDOWS = rf"""# seginternet — Setup Windows
 # Clique com botão direito > "Executar com PowerShell"
@@ -1235,7 +1235,7 @@ elif page == "💻 Instalar Localmente":
 # Requer Python 3.11+ instalado
 # Baixe em https://python.org se necessário
 
-git clone https://github.com/rochainf/seginternet.git
+git clone https://github.com/PgSa9XkUDPyR/seginternet.git
 cd seginternet
 python -m venv .venv
 .venv\\Scripts\\pip install -r requirements.txt
@@ -1255,7 +1255,7 @@ python -m venv .venv
         st.code("""\
 # Requer Python 3.11+ e git instalados
 
-git clone https://github.com/rochainf/seginternet.git
+git clone https://github.com/PgSa9XkUDPyR/seginternet.git
 cd seginternet
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
