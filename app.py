@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import socket
 import sys
-import zipfile
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -82,48 +80,40 @@ def _webrtc_component(height: int = 110) -> None:
     </script>""", height=height)
 
 
-def _project_zip() -> bytes:
-    root = Path(__file__).parent
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in ("app.py", "requirements.txt", "pyproject.toml", "setup.cfg", "README.md"):
-            f = root / name
-            if f.exists():
-                zf.write(f, name)
-        src = root / "src"
-        if src.exists():
-            for f in src.rglob("*.py"):
-                zf.write(f, f.relative_to(root))
-    buf.seek(0)
-    return buf.read()
 
+_REPO_URL = "https://github.com/rochainf/seginternet.git"
 
-_SETUP_WINDOWS = r"""# seginternet — Setup Windows
-# Coloque este arquivo na mesma pasta do seginternet.zip
+_SETUP_WINDOWS = rf"""# seginternet — Setup Windows
 # Clique com botão direito > "Executar com PowerShell"
 
 $ErrorActionPreference = "Stop"
 $dir = "$env:USERPROFILE\seginternet"
 Write-Host "`n📦 seginternet — Instalação Windows" -ForegroundColor Cyan
 
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {{
     Write-Host "Python não encontrado. Instalando via winget..." -ForegroundColor Yellow
     winget install -e --id Python.Python.3.11 --accept-source-agreements --accept-package-agreements
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-}
-$ver = python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+}}
+$ver = python -c "import sys; print(f'{{sys.version_info.major}}.{{sys.version_info.minor}}')"
 Write-Host "✔ Python $ver" -ForegroundColor Green
 
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$zip = Join-Path $PSScriptRoot "seginternet.zip"
-if (-not (Test-Path $zip)) {
-    Write-Host "❌ seginternet.zip não encontrado na mesma pasta deste script." -ForegroundColor Red
-    exit 1
-}
-Expand-Archive -Path $zip -DestinationPath $dir -Force
-Write-Host "✔ Arquivos extraídos em $dir" -ForegroundColor Green
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {{
+    Write-Host "Git não encontrado. Instalando via winget..." -ForegroundColor Yellow
+    winget install -e --id Git.Git --accept-source-agreements --accept-package-agreements
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+}}
 
-Set-Location $dir
+if (Test-Path $dir) {{
+    Write-Host "Repositório já existe. Atualizando..." -ForegroundColor Yellow
+    Set-Location $dir
+    git pull
+}} else {{
+    git clone {_REPO_URL} $dir
+    Write-Host "✔ Repositório clonado em $dir" -ForegroundColor Green
+    Set-Location $dir
+}}
+
 python -m venv .venv
 & ".venv\Scripts\pip" install -r requirements.txt -q
 & ".venv\Scripts\pip" install -e . -q
@@ -132,28 +122,28 @@ Write-Host "`n✅ Pronto! Iniciando o app..." -ForegroundColor Green
 Start-Process ".venv\Scripts\python.exe" -ArgumentList "-m","streamlit","run","app.py" -WorkingDirectory $dir
 """
 
-_SETUP_LINUX = """\
+_SETUP_LINUX = f"""\
 #!/bin/bash
 # seginternet — Setup Linux / macOS
-# Coloque na mesma pasta do seginternet.zip e execute:
-#   chmod +x setup_linux.sh && ./setup_linux.sh
+# Execute: chmod +x setup_linux.sh && ./setup_linux.sh
 
 set -e
 DIR="$HOME/seginternet"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo && echo "📦 seginternet — Instalação Linux/macOS"
 
-command -v python3 &>/dev/null || { echo "❌ Python3 não encontrado. Instale Python 3.11+"; exit 1; }
-echo "✔ Python $(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")"
+command -v python3 &>/dev/null || {{ echo "❌ Python3 não encontrado. Instale Python 3.11+"; exit 1; }}
+command -v git    &>/dev/null || {{ echo "❌ git não encontrado. Instale git"; exit 1; }}
+echo "✔ Python $(python3 -c "import sys; print(f'{{sys.version_info.major}}.{{sys.version_info.minor}}')")"
 
-mkdir -p "$DIR"
-ZIP="$SCRIPT_DIR/seginternet.zip"
-[ -f "$ZIP" ] || { echo "❌ seginternet.zip não encontrado em $SCRIPT_DIR"; exit 1; }
+if [ -d "$DIR/.git" ]; then
+    echo "Repositório já existe. Atualizando..."
+    cd "$DIR" && git pull
+else
+    git clone {_REPO_URL} "$DIR"
+    echo "✔ Repositório clonado em $DIR"
+    cd "$DIR"
+fi
 
-unzip -o "$ZIP" -d "$DIR" > /dev/null
-echo "✔ Arquivos extraídos em $DIR"
-
-cd "$DIR"
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt -q
 .venv/bin/pip install -e . -q
@@ -1231,76 +1221,67 @@ elif page == "💻 Instalar Localmente":
     )
 
     st.divider()
-    st.markdown("## Passo a passo")
-
-    st.markdown("### 1️⃣ Baixe o código-fonte")
-    zip_data = _project_zip()
-    st.download_button(
-        label="⬇️ Baixar seginternet.zip",
-        data=zip_data,
-        file_name="seginternet.zip",
-        mime="application/zip",
-        use_container_width=True,
-        type="primary",
+    st.markdown("## Instalação via GitHub (recomendado)")
+    st.markdown(
+        "O repositório está disponível no GitHub. "
+        "Qualquer atualização publicada fica disponível automaticamente."
     )
-
-    st.divider()
-    st.markdown("### 2️⃣ Baixe o script de instalação para seu sistema")
 
     col_win, col_lin = st.columns(2)
 
     with col_win:
-        st.markdown("#### 🪟 Windows")
-        st.markdown("Coloque o `.ps1` na mesma pasta do ZIP e execute com botão direito → *Executar com PowerShell*.")
+        st.markdown("#### 🪟 Windows (PowerShell)")
+        st.code("""\
+# Requer Python 3.11+ instalado
+# Baixe em https://python.org se necessário
+
+git clone https://github.com/rochainf/seginternet.git
+cd seginternet
+python -m venv .venv
+.venv\\Scripts\\pip install -r requirements.txt
+.venv\\Scripts\\pip install -e .
+.venv\\Scripts\\python -m streamlit run app.py
+""", language="powershell")
         st.download_button(
-            label="⬇️ setup_windows.ps1",
+            label="⬇️ Baixar setup_windows.ps1",
             data=_SETUP_WINDOWS,
             file_name="setup_windows.ps1",
             mime="text/plain",
             use_container_width=True,
         )
-        with st.expander("Ver conteúdo do script"):
-            st.code(_SETUP_WINDOWS, language="powershell")
 
     with col_lin:
         st.markdown("#### 🐧 Linux / 🍎 macOS")
-        st.markdown("Coloque o `.sh` na mesma pasta do ZIP e execute: `bash setup_linux.sh`")
+        st.code("""\
+# Requer Python 3.11+ e git instalados
+
+git clone https://github.com/rochainf/seginternet.git
+cd seginternet
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .
+.venv/bin/python -m streamlit run app.py
+""", language="bash")
         st.download_button(
-            label="⬇️ setup_linux.sh",
+            label="⬇️ Baixar setup_linux.sh",
             data=_SETUP_LINUX,
             file_name="setup_linux.sh",
             mime="text/plain",
             use_container_width=True,
         )
-        with st.expander("Ver conteúdo do script"):
-            st.code(_SETUP_LINUX, language="bash")
 
     st.divider()
-    st.markdown("### 3️⃣ O que o script faz automaticamente")
+    st.markdown("## Para atualizar")
+    st.code("cd seginternet && git pull && .venv/bin/pip install -e . -q", language="bash")
+
+    st.divider()
+    st.markdown("## O que os scripts fazem")
     st.markdown("""
     | Passo | Descrição |
     |-------|-----------|
     | ✔ Verifica Python | Instala Python 3.11 via `winget` se não encontrar (Windows) |
-    | ✔ Extrai o ZIP | Coloca os arquivos em `~/seginternet` |
+    | ✔ Clona o repositório | `git clone` do GitHub — sem baixar código do servidor |
     | ✔ Cria venv | Ambiente isolado — não afeta outros projetos Python |
     | ✔ Instala dependências | `pip install -r requirements.txt` |
-    | ✔ Abre o app | Inicia o Streamlit e abre no navegador automaticamente |
+    | ✔ Abre o app | Inicia o Streamlit no navegador automaticamente |
     """)
-
-    st.divider()
-    st.markdown("### 4️⃣ Instalação manual (alternativa)")
-    st.code("""\
-# Extraia o ZIP numa pasta, depois no terminal:
-
-python -m venv .venv
-
-# Windows:
-.venv\\Scripts\\pip install -r requirements.txt
-.venv\\Scripts\\pip install -e .
-.venv\\Scripts\\python -m streamlit run app.py
-
-# Linux / macOS:
-.venv/bin/pip install -r requirements.txt
-.venv/bin/pip install -e .
-.venv/bin/python -m streamlit run app.py
-""", language="bash")
